@@ -231,7 +231,7 @@ class UtilitiesS3:
         self,
         file_name: Optional[list or str] = [],        
         cast_schema: Optional[bool] = False, 
-        image_folder: Optional[bool] = False,
+        all_folder: Optional[bool] = False,
         base_uri: Optional[str] = None,
         **pandas_args        
         ) -> dict:
@@ -249,12 +249,12 @@ class UtilitiesS3:
         _file_name = file_name if isinstance(file_name, list) else [file_name]
         _datasets = {}
         
-        if not _file_name and image_folder == False:
+        if not _file_name and all_folder == False:
             raise ValueError(
                 f"No filename to be loaded was given, artibuto: 'file_name'"
             )
             
-        if not _file_name and image_folder:
+        if not _file_name and all_folder:
             
             fpath = f"s3://{self.s3.AWS_BUCKET}/{base_uri}"
             
