@@ -1,14 +1,13 @@
 import boto3
 import pandas as pd
-import logging
 import pickle 
 import json
 import fsspec
+import awswrangler as wr    
 
+from PIL import Image
 from io import BytesIO
 from typing import Any, Optional, Tuple
-
-logger = logging.getLogger(__name__)
 
 class EnvConfig:
     ''''
@@ -76,8 +75,8 @@ class S3Config:
         data = s3.get_object(
             Bucket=self.AWS_BUCKET, 
             Key=key_name
-        )['Body'].read()
-        
+        )['Body']
+
         return data
 
 class FetchS3Data:
@@ -91,13 +90,12 @@ class FetchS3Data:
         '''
         Process an fsspec compatible URI into a FileSystem instance
         and the parsed "path".
+                Args:
+                    uri: A fsspec compatible URI
 
-            Args:
-                uri: A fsspec compatible URI
-
-            Returns:
-                fs: A configured fsspec FileSystem instance
-                path: The path component of the URI
+                Returns:
+                    fs: A configured fsspec FileSystem instance
+                    path: The path component of the URI
         '''
 
         opts = {
@@ -109,7 +107,6 @@ class FetchS3Data:
         
         return fs, path
     
-        
     def make_parents(self, fs, path) -> Any:
         '''
         Make parent dirs of path
@@ -117,33 +114,40 @@ class FetchS3Data:
         parent = path.rsplit("/", 1)[0]
         fs.makedirs(parent, exist_ok=True)    
         
-    
     def load_data(self, info):
             
         data = self.s3.get_object_bucket(info['path'], self.client)
-        kwargs = info.get('pandas_args')
-
+        
         function = {
             'parquet':pd.read_parquet,
             'excel':pd.read_excel,
             'csv':pd.read_csv,
             'json':json.loads, 
-            'pickle':pickle.loads 
+            'pickle':pickle.loads,
+            'image':Image.open
         }
         
-        if info['format'] not in ['pickle','json']:
-            return function.get(info['format'])(BytesIO(data), **kwargs)
+        if info['format'] in ['parquet','excel','csv']:
+            kwargs = info.get('pandas_args')
+            return function.get(info['format'])(BytesIO(data.read()), **kwargs)
         
-        else:                     
-            return function.get(info['format'])(data)  
-    
-    
+        elif info['format'] in ['pickle','json']:
+            return function.get(info['format'])(data.read()) 
+        
+        elif info['format'] == 'image':                     
+            return function.get(info['format'])(data) 
+        
+        else:
+            raise ValueError(
+                f"The object format for '{info['path']}' must be "
+                f"instead of '_[{info['format']}]_'"
+            )
+
     def save_data(self, obj, info):
         
         kwargs = info.get('pandas_args')
         
         if info['format'] in ['parquet','excel','csv']:
-            logger.info(f"Saving {info['path']} into {info['format']}")
             
             with BytesIO() as output:
                 getattr(obj, f"to_{info['format']}", None)(output, **kwargs)
@@ -168,7 +172,6 @@ class FetchS3Data:
             self.make_parents(fs, path)
             
             with fs.open(path, "wb") as f:
-                logger.info(f"Saving {info['path']} into {info['format']}")
                 
                 if info['format'] == 'pickle':
                     return function.get(info['format'])(obj, f)
@@ -179,7 +182,7 @@ class FetchS3Data:
 
         else:
             raise ValueError(
-                f"The dataset format for '{info['path']}' must be "
+                f"The object format for '{info['path']}' must be "
                 f"instead of '_[{info['format']}]_'"
             )
         
@@ -188,8 +191,8 @@ class UtilitiesS3:
     '''
     Class to build the datasets
             Args:
-                df   : Dataframe with the data of each file that will be loaded in s3.
-                conn : Bucket access credentials in s3.
+                datasets : Dataframe with the data of each file that will be loaded in s3.
+                conn     : Bucket access credentials in s3.
                     >>  access_key:  (string) -- AWS access key ID.
                     >>  secret_key:  (string) -- AWS secret access key.
                     >>  bucket_name: (string) -- The name of the bucket to S3.
@@ -198,6 +201,7 @@ class UtilitiesS3:
        
     def __init__(self, datasets: dict, conn: dict):
         self.fd = FetchS3Data(conn)
+        self.s3 = S3Config(conn)
         
         for k, v in datasets.items():
             for _k, _v in v.items():
@@ -225,8 +229,10 @@ class UtilitiesS3:
                     
     def load_file(
         self,
-        file_name: list or str,        
-        cast_schema: Optional[bool] = False,  
+        file_name: Optional[list or str] = [],        
+        cast_schema: Optional[bool] = False, 
+        image_folder: Optional[bool] = False,
+        base_uri: Optional[str] = None,
         **pandas_args        
         ) -> dict:
         '''
@@ -235,21 +241,45 @@ class UtilitiesS3:
                 Args:
                     file_name   : List of file names.
                     cast_schema : Option to cast and filter the dataset to the specified schema.
+                    image_folder: Enables downloading of all images in the specified folder.
+                    base_uri    : Base path where the files are.
                     pandas_args : Extra arguments to pass to the "to_" function.
         '''
                 
         _file_name = file_name if isinstance(file_name, list) else [file_name]
         _datasets = {}
         
-        if not _file_name :
+        if not _file_name and image_folder == False:
             raise ValueError(
                 f"No filename to be loaded was given, artibuto: 'file_name'"
             )
-        
-        for f in _file_name :
+            
+        if not _file_name and image_folder:
+            
+            fpath = f"s3://{self.s3.AWS_BUCKET}/{base_uri}"
+            
+            _image_name = wr.s3.list_objects(fpath)
+            if not _image_name:
+                    raise ValueError(
+                f"An error occurred (NoSuchKey) when calling the GetObject "
+                f"operation: The specified key does not exist."
+            )
+                            
+            i=0    
+            for f in _image_name:
+                _file_name.append(f'image{i}')
+                self.datasets[f'image{i}']={
+                    "path":f'{base_uri}{f.split("/")[-1]}',
+                    "format":'image',
+                    "pandas_args":{},
+                    "schema":{}
+                }
+                i+=1
+
+        for f in _file_name:
             if f not in self.datasets:
                 raise ValueError(
-                    f"The dataset '{f}' must be in list "
+                    f"The object '{f}' must be in list "
                     f"Indicated by the user"
                 )
                 
@@ -264,20 +294,16 @@ class UtilitiesS3:
                 else df
                 )
             
-            elif info['format'] in ['pickle','json']:
+            elif info['format'] in ['pickle','json','image']:
                 _datasets[f] = self.fd.load_data(info)
             
             else:
                 raise ValueError(
-                    f"The dataset format for '{info['path']}' must be "
+                    f"The object format for '{info['path']}' must be "
                     f"instead of '_[{info['format']}]_'"
                 )
         
-        if len(_file_name) > 1:     
-            return _datasets
-        
-        else:
-            return _datasets[_file_name[0]]
+        return _datasets
     
     
     def save_file(
@@ -311,4 +337,4 @@ class UtilitiesS3:
         else obj
         )
         
-        self.fd.save_data(_obj, info)
+        self.fd.save_data(_obj, info)      
