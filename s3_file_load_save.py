@@ -258,7 +258,7 @@ class UtilitiesS3:
             
             fpath = f"s3://{self.s3.AWS_BUCKET}/{base_uri}"
             
-            _image_name = wr.s3.list_objects(fpath)
+            _image_name = wr.s3.list_objects(fpath, boto3_session=self.s3.get_session())
             if not _image_name:
                     raise ValueError(
                 f"An error occurred (NoSuchKey) when calling the GetObject "
