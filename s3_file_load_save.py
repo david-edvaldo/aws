@@ -3,12 +3,27 @@ import pandas as pd
 import pickle 
 import json
 import fsspec
-import awswrangler as wr    
+import awswrangler as wr
+import os    
 
 from PIL import Image
 from io import BytesIO
 from typing import Any, Optional, Tuple
 
+FILEEXTENS = {
+    '.xls' :'excel',
+    '.xlsx':'excel',
+    '.xlsm':'excel',
+    '.xlsb':'excel',
+    '.csv' :'csv',
+    '.parquet':'parquet',
+    '.json':'json',
+    '.pickle':'pickle'       
+} 
+
+for ext in Image.registered_extensions():
+    FILEEXTENS[ext] = 'image'
+    
 class EnvConfig:
     ''''
     Class specifications credentials aws
@@ -199,16 +214,21 @@ class UtilitiesS3:
                     >>  region_name: (string) -- Default region when creating new connections
     '''
        
-    def __init__(self, datasets: dict, conn: dict):
+    def __init__(self, conn: dict, datasets: Optional[dict] = {}):
         self.fd = FetchS3Data(conn)
         self.s3 = S3Config(conn)
         
-        for k, v in datasets.items():
-            for _k, _v in v.items():
-                if len(_v) == 0:
-                    datasets[k][_k] = {}
-                    
-        self.datasets = datasets
+        self.datasets = {}
+        if datasets:
+            for k, v in datasets.items():
+                for _k, _v in v.items():
+                    if _k in ['pandas_args','schema'] and len(_v) == 0:
+                        datasets[k][_k] = {}
+                
+                _, file_format = os.path.splitext(v['path'])    
+                datasets[k]['format'] = FILEEXTENS.get(file_format)
+                        
+            self.datasets = datasets
 
     def _cast_schema(self, df, schema):
         '''Filter and convert dtypes to the specified schema'''
@@ -226,57 +246,73 @@ class UtilitiesS3:
         else:
             return df
      
-                    
+    def load_folder(
+        self,
+        base_uri: str, 
+        ) -> dict:
+        '''
+        Load a object in all folder.
+        Types de object ['parquet', 'excel', 'csv', 'json', 'pickle', 'image']
+                Args:
+                    base_uri : Base path where the files are.
+        '''
+        
+        self.datasets = {}
+        self.file_name = []
+        fpath = f"s3://{self.s3.AWS_BUCKET}/{base_uri}"
+        
+        _all_name = wr.s3.list_objects(fpath, boto3_session=self.s3.get_session())
+        if not _all_name:
+                raise ValueError(
+            f"An error occurred (NoSuchKey) when calling the GetObject "
+            f"operation: The specified key does not exist."
+        )
+                
+        i=0    
+        for f in _all_name:
+            _, file_format = os.path.splitext(f) 
+            _ext = FILEEXTENS.get(file_format)   
+            self.file_name.append(f'{_ext}_{i}')
+            
+            self.datasets[f'{_ext}_{i}']={
+                "path":f'{base_uri}{f.split("/")[-1]}',
+                "format":_ext,
+                "pandas_args":{},
+                "schema":{}
+            }
+            i+=1
+            
+        self.cast_schema = False 
+        self.pandas_args = {}   
+        
+        return self.flow_load()
+        
+                          
     def load_file(
         self,
-        file_name: Optional[list or str] = [],        
+        file_name: list,        
         cast_schema: Optional[bool] = False, 
-        all_folder: Optional[bool] = False,
-        base_uri: Optional[str] = None,
         **pandas_args        
         ) -> dict:
         '''
         Load a object must be "pickable".
-        Types de object ['parquet', 'excel', 'csv', 'json', 'pickle']
+        Types de object ['parquet', 'excel', 'csv', 'json', 'pickle', 'image']
                 Args:
                     file_name   : List of file names.
                     cast_schema : Option to cast and filter the dataset to the specified schema.
-                    image_folder: Enables downloading of all images in the specified folder.
-                    base_uri    : Base path where the files are.
                     pandas_args : Extra arguments to pass to the "to_" function.
         '''
-                
-        _file_name = file_name if isinstance(file_name, list) else [file_name]
-        _datasets = {}
+                        
+        self.file_name = file_name if isinstance(file_name, list) else [file_name]
         
-        if not _file_name and all_folder == False:
-            raise ValueError(
-                f"No filename to be loaded was given, artibuto: 'file_name'"
-            )
-            
-        if not _file_name and all_folder:
-            
-            fpath = f"s3://{self.s3.AWS_BUCKET}/{base_uri}"
-            
-            _image_name = wr.s3.list_objects(fpath, boto3_session=self.s3.get_session())
-            if not _image_name:
-                    raise ValueError(
-                f"An error occurred (NoSuchKey) when calling the GetObject "
-                f"operation: The specified key does not exist."
-            )
-                            
-            i=0    
-            for f in _image_name:
-                _file_name.append(f'image{i}')
-                self.datasets[f'image{i}']={
-                    "path":f'{base_uri}{f.split("/")[-1]}',
-                    "format":'image',
-                    "pandas_args":{},
-                    "schema":{}
-                }
-                i+=1
-
-        for f in _file_name:
+        self.cast_schema = cast_schema
+        self.pandas_args = pandas_args
+        
+        return self.flow_load()
+        
+    def flow_load(self):
+        _datasets = {}
+        for f in self.file_name:
             if f not in self.datasets:
                 raise ValueError(
                     f"The object '{f}' must be in list "
@@ -284,13 +320,13 @@ class UtilitiesS3:
                 )
                 
             info = self.datasets.get(f)
-            info['pandas_args'].update(pandas_args)
+            info['pandas_args'].update(self.pandas_args)
             
-            if info['format'] in ['excel', 'csv', 'parquet']:
+            if info['format'] in ['excel','csv','parquet']:
                 
                 df = self.fd.load_data(info)
                 _datasets[f] = (self._cast_schema(df, info['schema']) 
-                if cast_schema 
+                if self.cast_schema 
                 else df
                 )
             
@@ -323,9 +359,9 @@ class UtilitiesS3:
                     pandas_args : Extra arguments to pass to the "to_" function.
         '''
           
-        if isinstance(file_name, list):
+        if not isinstance(file_name, str):
             raise ValueError(
-                f'Attribute "file_name" needed only #1 filename: str not list'
+                f"Attribute 'file_name' needed only #1 filename: str"
             )
             
         _f = file_name 
