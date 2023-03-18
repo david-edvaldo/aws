@@ -93,7 +93,6 @@ class S3Config:
         )['Body']
 
         return data
-
 class FetchS3Data:
     
     def __init__(self, conn):
@@ -133,7 +132,7 @@ class FetchS3Data:
             
         data = self.s3.get_object_bucket(info['path'], self.client)
         
-        function = {
+        write_functions = {
             'parquet':pd.read_parquet,
             'excel':pd.read_excel,
             'csv':pd.read_csv,
@@ -142,65 +141,73 @@ class FetchS3Data:
             'image':Image.open
         }
         
-        if info['format'] in ['parquet','excel','csv']:
-            kwargs = info.get('pandas_args')
-            return function.get(info['format'])(BytesIO(data.read()), **kwargs)
+        file_format = info['format']
+        if file_format not in write_functions:
+            raise ValueError(f"Unsupported format '{file_format}'")
         
-        elif info['format'] in ['pickle','json']:
-            return function.get(info['format'])(data.read()) 
+        load_function = write_functions.get(file_format)
         
-        elif info['format'] == 'image':                     
-            return function.get(info['format'])(data) 
-        
-        else:
-            raise ValueError(
-                f"The object format for '{info['path']}' must be "
-                f"instead of '_[{info['format']}]_'"
-            )
-
+        try:
+            if file_format in ['parquet','excel','csv']:
+                pandas_args = info.get('pandas_args', {})
+                return load_function(BytesIO(data.read()), **pandas_args)
+            
+            elif file_format in ['pickle','json']:
+                return load_function(data.read()) 
+            
+            elif file_format == 'image':                     
+                return load_function(data) 
+            
+        except Exception as e:
+                raise ValueError(f"Failed to load data: {str(e)}")
+            
+            
     def save_data(self, obj, info):
         
-        kwargs = info.get('pandas_args')
+        file_format = info['format']  
         
-        if info['format'] in ['parquet','excel','csv']:
-            
-            with BytesIO() as output:
-                getattr(obj, f"to_{info['format']}", None)(output, **kwargs)
-                data = output.getvalue()
+        try:      
+            if file_format in ['parquet','excel','csv']:
+                pandas_args = info.get('pandas_args', {})
+                
+                with BytesIO() as output:
+                    getattr(obj, f"to_{file_format}", None)(output, **pandas_args)
+                    data = output.getvalue()
 
-            self.resource.Object(
-                self.s3.AWS_BUCKET,
-                info['path']
-            ).put(Body=data)
-        
-        
-        elif info['format'] in ['pickle','json']:
+                s3_object = self.resource.Object(self.s3.AWS_BUCKET, info['path'])
+                s3_object.put(Body=data)
+            
+            elif file_format in ['pickle','json']:
+                        
+                s3_path = f"s3://{self.s3.AWS_BUCKET}/{info['path']}"
                     
-            info_path = f"s3://{self.s3.AWS_BUCKET}/{info['path']}"
+                write_functions = {
+                    'json':json.dumps,
+                    'pickle':pickle.dump
+                }
                 
-            function = {
-                'json':json.dumps,
-                'pickle':pickle.dump
-            }
-            
-            fs, path = self.get_fs_path(info_path)
-            self.make_parents(fs, path)
-            
-            with fs.open(path, "wb") as f:
+                save_function = write_functions.get(file_format)
                 
-                if info['format'] == 'pickle':
-                    return function.get(info['format'])(obj, f)
+                fs, path = self.get_fs_path(s3_path)
+                self.make_parents(fs, path)
                 
-                elif info['format'] == 'json':
-                    raw = function.get(info['format'])(obj)
-                    f.write(str.encode(raw))
+                with fs.open(path, "wb") as file:
+                    
+                    if file_format == 'pickle':
+                        return save_function(obj, file)
+                    
+                    elif file_format == 'json':
+                        raw = save_function(obj)
+                        file.write(str.encode(raw))
 
-        else:
-            raise ValueError(
-                f"The object format for '{info['path']}' must be "
-                f"instead of '_[{info['format']}]_'"
-            )
-        
+            else:
+                raise ValueError(
+                    f"The object format for '{info['path']}' must be "
+                    f"instead of '_[{file_format}]_'"
+                )
+                
+        except Exception as e:
+                raise ValueError(f"Failed to save data: {str(e)}")
         
 class UtilitiesS3:
     '''
@@ -218,20 +225,45 @@ class UtilitiesS3:
         self.fd = FetchS3Data(conn)
         self.s3 = S3Config(conn)
         
-        self.datasets = {}
+        self.datasets = {}       
         if datasets:
-            for k, v in datasets.items():
-                for _k, _v in v.items():
-                    if _k in ['pandas_args','schema'] and len(_v) == 0:
-                        datasets[k][_k] = {}
+            for name, info in datasets.items():
                 
-                _, file_format = os.path.splitext(v['path'])    
-                datasets[k]['format'] = FILEEXTENS.get(file_format)
-                        
-            self.datasets = datasets
+                pandas_args = info.get('pandas_args', {})
+                schema = info.get('schema', {})
+                
+                for key in ['pandas_args', 'schema']:
+                    if not info.get(key):
+                        info[key] = {}
 
-    def _cast_schema(self, df, schema):
-        '''Filter and convert dtypes to the specified schema'''
+                _, ext = os.path.splitext(info['path'])
+                format_ = FILEEXTENS.get(ext)
+
+                if not format_:
+                    raise ValueError(f"Unknown file extension: {ext}")
+
+                self.datasets[name] = {
+                    'path': info['path'],
+                    'format': format_,
+                    'pandas_args': pandas_args,
+                    'schema': schema,
+                }
+
+    def _cast_schema(
+        self, 
+        df: pd.DataFrame, 
+        schema: dict
+        ) -> pd.DataFrame:
+        '''
+        Filter and convert dtypes to the specified schema.
+
+            Args:
+                df     : The input DataFrame.
+                schema : A dictionaries specifying the desired dtypes for columns.
+
+            Returns:
+                pd.DataFrame: The filtered and type-casted DataFrame.
+        '''
         if len(schema) > 0:
             cols = []
             for case in schema:
@@ -256,35 +288,35 @@ class UtilitiesS3:
                 Args:
                     base_uri : Base path where the files are.
         '''
-        
         self.datasets = {}
         self.file_name = []
+        
         fpath = f"s3://{self.s3.AWS_BUCKET}/{base_uri}"
         
-        _all_name = wr.s3.list_objects(fpath, boto3_session=self.s3.get_session())
-        if not _all_name:
+        all_files = wr.s3.list_objects(fpath, boto3_session=self.s3.get_session())
+        
+        if not all_files:
                 raise ValueError(
             f"An error occurred (NoSuchKey) when calling the GetObject "
             f"operation: The specified key does not exist."
         )
                 
-        i=0    
-        for f in _all_name:
-            _, file_format = os.path.splitext(f) 
-            _ext = FILEEXTENS.get(file_format)   
-            self.file_name.append(f'{_ext}_{i}')
+        for i, f in enumerate(all_files):
             
-            self.datasets[f'{_ext}_{i}']={
+            _, file_format = os.path.splitext(f) 
+            ext = FILEEXTENS.get(file_format)  
+             
+            self.file_name.append(f'{ext}_{i}')
+            self.datasets[f'{ext}_{i}']={
                 "path":f'{base_uri}{f.split("/")[-1]}',
-                "format":_ext,
+                "format":ext,
                 "pandas_args":{},
                 "schema":{}
             }
-            i+=1
-            
+               
         self.cast_schema = False 
-        self.pandas_args = {}   
-        
+        self.pandas_args = {}  
+         
         return self.flow_load()
         
                           
@@ -302,9 +334,16 @@ class UtilitiesS3:
                     cast_schema : Option to cast and filter the dataset to the specified schema.
                     pandas_args : Extra arguments to pass to the "to_" function.
         '''
-                        
-        self.file_name = file_name if isinstance(file_name, list) else [file_name]
         
+        if not file_name:
+            raise ValueError("The 'file_name' parameter cannot be empty.")
+        
+        file_name = file_name if isinstance(file_name, list) else [file_name]
+        
+        if not all(isinstance(f, str) for f in file_name):
+            raise TypeError("All elements in the 'file_name' list must be strings.")
+        
+        self.file_name = file_name
         self.cast_schema = cast_schema
         self.pandas_args = pandas_args
         
@@ -312,32 +351,33 @@ class UtilitiesS3:
         
     def flow_load(self):
         _datasets = {}
-        for f in self.file_name:
-            if f not in self.datasets:
+        for file_name in self.file_name:
+            info = self.datasets.get(file_name)
+            
+            if info is None:
                 raise ValueError(
-                    f"The object '{f}' must be in list "
-                    f"Indicated by the user"
+                    f"The file '{file_name}' is not available in the dataset"
                 )
+
+            file_format = info['format'] 
+            if file_format in ['excel','csv','parquet']:
                 
-            info = self.datasets.get(f)
-            info['pandas_args'].update(self.pandas_args)
-            
-            if info['format'] in ['excel','csv','parquet']:
-                
+                info['pandas_args'].update(self.pandas_args)
                 df = self.fd.load_data(info)
-                _datasets[f] = (self._cast_schema(df, info['schema']) 
-                if self.cast_schema 
-                else df
-                )
+                
+                if self.cast_schema:
+                    df = self._cast_schema(df, info['schema'])
             
-            elif info['format'] in ['pickle','json','image']:
-                _datasets[f] = self.fd.load_data(info)
+            elif file_format in ['pickle','json','image']:
+                df = self.fd.load_data(info)
             
             else:
                 raise ValueError(
                     f"The object format for '{info['path']}' must be "
                     f"instead of '_[{info['format']}]_'"
                 )
+                
+            _datasets[file_name] = df
         
         return _datasets
     
@@ -354,23 +394,25 @@ class UtilitiesS3:
         Types de object ['parquet', 'excel', 'csv', 'json', 'pickle']
                 Args:
                     obj         : The object to save. Must be "pickable".
-                    file_name   : List of file names.
+                    file_name   : Name of the file to save the object.
                     cast_schema : Option to cast and filter the dataset to the specified schema.
                     pandas_args : Extra arguments to pass to the "to_" function.
         '''
+        if not isinstance(obj, (bytes, bytearray)):
+            raise ValueError("Object must be pickable")
           
         if not isinstance(file_name, str):
             raise ValueError(
                 f"Attribute 'file_name' needed only #1 filename: str"
             )
             
-        _f = file_name 
-        info = self.datasets.get(_f)
-        info['pandas_args'].update(pandas_args)
+        dataset_info = self.datasets.get(file_name)
+        if not dataset_info:
+            raise ValueError(f"Dataset with name {file_name} not found")
         
-        _obj = (self._cast_schema(obj, info['schema']) 
-        if cast_schema 
-        else obj
-        )
+        dataset_info['pandas_args'].update(pandas_args)
         
-        self.fd.save_data(_obj, info)      
+        if cast_schema:
+            obj = self._cast_schema(obj, dataset_info['schema'])
+        
+        self.fd.save_data(obj, dataset_info)      
