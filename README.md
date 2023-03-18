@@ -21,6 +21,7 @@ A classe **UtilitiesS3** possui duas funções chamadas "load_folder" e "load_fi
 Para carregar os dados, você deve seguir o exemplo:
 
 1. Carregar um ou mais arquivo:
+
 ![image](https://user-images.githubusercontent.com/78990428/226076121-f9ef55af-dc07-4458-a335-050191f71233.png)
 
 * No dicionário **conn**, deverá conter as credencias para acesso a AWS;
@@ -36,7 +37,9 @@ Para carregar os dados, você deve seguir o exemplo:
 
 2. Carregar todos os arquivos dentro de uma pasta:
 * Você pode usar o mesmo objeto instanciado anteriormente, ou instância um o novo com somente as credencias da AWS.
+
 ![image](https://user-images.githubusercontent.com/78990428/226076974-0f68be66-8742-473e-84ec-533ac6e6def5.png)
+
 * Passando para o método o atributo "base_uri", onde está armazenado todos os arquivos que deseja ser carregado.
 * O retorno do método será um dicionário.
 
@@ -46,4 +49,5 @@ Para carregar os dados, você deve seguir o exemplo:
 3.2 - file_name   : Nome do arquivo para salvar o objeto, o nome deverá estar no dicionário **dataset_info**..
 3.3 - cast_schema : Opção para converter e filtrar o conjunto de dados para o esquema especificado. (Opcional)
 3.4 - pandas_args : Argumentos extras para passar para a função salvar os arquivos. (Opcional)
+
 ![image](https://user-images.githubusercontent.com/78990428/226077498-0456a0a9-0c17-44c5-b0e4-a6425df1a50d.png)
